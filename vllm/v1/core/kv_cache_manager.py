@@ -14,6 +14,18 @@ from vllm.v1.request import Request, RequestStatus
 
 logger = init_logger(__name__)
 
+import json, os
+from pathlib import Path
+from typing import Protocol, Any
+
+class KVTensorProvider(Protocol):
+    def export_blocks(self) -> dict[str, Any]: ...
+
+KV_TENSOR_PROVIDER: Optional[KVTensorProvider] = None
+
+def register_kv_tensor_provider(provider: KVTensorProvider) -> None:
+    global KV_TENSOR_PROVIDER
+    KV_TENSOR_PROVIDER = provider
 
 @dataclass
 class KVCacheBlocks:
@@ -279,6 +291,18 @@ class KVCacheManager:
         Args:
             request: The request to free the blocks.
         """
+        outdir = os.getenv("VLLM_STORE_KV_DIR", "")
+        if outdir:
+            req_dir = os.path.join(outdir, request.request_id)
+            try:
+                logger.info(f"[kv-store] Exporting KV cache to {req_dir}")
+                
+                fname = f"{request.request_id}.kv.json"
+                self.export_kv_cache(request, os.path.join(req_dir, fname))
+                
+                logger.info(f"[kv-store] Exported KV cache to {req_dir}")
+            except Exception as e:
+                logger.warning("[kv-store] KV dump failed for %s: %s", request.request_id, e)
         self.coordinator.free(request.request_id)
 
     def reset_prefix_cache(self) -> bool:
@@ -362,3 +386,40 @@ class KVCacheManager:
         """Creates a new KVCacheBlocks instance with no blocks."""
         return KVCacheBlocks(tuple([]
                                    for _ in range(self.num_kv_cache_groups)))
+    
+    def export_kv_cache(self, request: Request, out_path: str) -> None:
+        """Save KV cache for this request."""
+        if KV_TENSOR_PROVIDER is None:
+            logger.warning("No KV tensor provider registered; skipping dump.")
+            return
+
+        if self.block_size and self.block_size > 0:
+            rem = request.num_tokens % self.block_size
+            last_block_valid_tokens = rem if rem > 0 else (self.block_size if request.num_tokens > 0 else 0)
+        else:
+            last_block_valid_tokens = request.num_tokens
+
+        data = KV_TENSOR_PROVIDER.export_blocks()
+
+        payload = {
+            "request_id": request.request_id,
+            "model_max_len": self.max_model_len,
+            "block_size": int(self.block_size or 0),
+            "used_block_rows": data.get("rows", []),
+            "last_block_valid_tokens": int(last_block_valid_tokens),
+            "data": {
+                "dtype": data.get("dtype", ""),
+                "num_blocks": data.get("num_blocks", 0),
+                "blocks": data.get("blocks", []),
+            },
+        }
+
+        p = Path(out_path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        with p.open("w") as f:
+            json.dump(payload, f)
+
+        metadata = {k: v for k, v in payload.items() if k != "data"}
+        metadata_path = out_path.replace(".kv.json", ".kv.metadata.json")
+        with open(metadata_path, "w") as rf:
+            json.dump(metadata, rf, indent=2)

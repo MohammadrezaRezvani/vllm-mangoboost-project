@@ -97,6 +97,8 @@ else:
         "xgr_torch_compile", globals(),
         "xgrammar.kernels.apply_token_bitmask_inplace_torch_compile")
 
+from vllm.v1.core.kv_cache_manager import register_kv_tensor_provider
+
 logger = init_logger(__name__)
 
 
@@ -117,6 +119,13 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         self.scheduler_config = vllm_config.scheduler_config
         self.speculative_config = vllm_config.speculative_config
         self.observability_config = vllm_config.observability_config
+
+        try:
+            if not hasattr(self, "kv_provider_registered"):
+                register_kv_tensor_provider(KVCacheTensorProvider(self))
+                self.kv_provider_registered = True
+        except Exception as e:
+            logger.warning("KV provider registration failed: %s", e)
 
         from vllm.model_executor.models.utils import set_cpu_offload_max_bytes
         set_cpu_offload_max_bytes(
@@ -174,6 +183,8 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         # indexes: [kv_cache_group_id][attn_group]
         self.attn_groups: list[list[AttentionGroup]] = []
         # self.kv_cache_config: KVCacheConfig
+
+        self.kv_caches_export: dict[str, torch.Tensor] | None = None
 
         # req_id -> (input_id -> encoder_output)
         self.encoder_cache: dict[str, dict[int, torch.Tensor]] = {}
@@ -3152,6 +3163,8 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         kv_caches = self._reshape_kv_cache_tensors(kv_cache_config,
                                                    kv_cache_raw_tensors)
 
+        self.kv_caches_export = kv_caches
+
         # Setup `kv_cache_config` and `kv_caches` for models
         # with cross-layer KV sharing
         if self.shared_kv_cache_layers:
@@ -3348,3 +3361,39 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 group_metadata[layer_name] = (common_metadata, metadata)
 
         return group_metadata
+
+class KVCacheTensorProvider(object):
+    def __init__(self, runner: "GPUModelRunner"):
+        self.runner = runner
+
+    @torch.no_grad()
+    def export_blocks(self, *_args, **_kwargs):
+        data = {
+            "dtype": str(next(self.runner.model.parameters()).dtype),
+            "rows": [], 
+            "num_blocks": 0, 
+            "blocks": []
+        }
+
+        kv = self.runner.kv_caches_export
+        if not isinstance(kv, dict) or not kv:
+            return data
+
+        first_tensor = next(iter(kv.values()))
+        nrows = int(first_tensor.shape[0])
+        if nrows <= 0:
+            return data
+
+        rows = list(range(nrows))
+        data["rows"] = rows
+        data["num_blocks"] = nrows
+
+        for r in rows:
+            blk = {"row": int(r), "kv": {}}
+            for layer_name, t in kv.items():
+                row = t[r].contiguous().cpu()
+                row = row.to(torch.float16)
+                blk["kv"][layer_name] = row.numpy().tolist()
+            data["blocks"].append(blk)
+
+        return data
